@@ -1,74 +1,84 @@
+from terraform_data_pipeline import TerraformDataPipeline
+from dataset_filter import DatasetFilter
 import os
-import tempfile
 import requests
 from github import Github
-import git
 from tqdm import tqdm
+import time
 
 class TerraformGitHubScraper:
     def __init__(self, github_token, output_dir):
         self.github_token = github_token
         self.output_dir = output_dir
         self.g = Github(self.github_token)
+        self.rate_limit_threshold = 10  # Threshold to start rate limit handling
 
-    def search_terraform_repos(self, max_repos=100):
-        query = "language:HCL filename:.tf"
-        repos = self.g.search_repositories(query=query, sort="stars", order="desc")
-        return list(repos)[:max_repos]
+    def search_terraform_files(self, max_files=1000):
+        query = "extension:tf language:HCL"
+        files = self.g.search_code(query=query, order="desc")
+        return files[:max_files]
 
-    def clone_repo(self, repo, temp_dir):
-        repo_dir = os.path.join(temp_dir, repo.name)
-        git.Repo.clone_from(repo.clone_url, repo_dir)
-        return repo_dir
+    def download_file_content(self, file_url):
+        headers = {'Authorization': f'token {self.github_token}'}
+        response = requests.get(file_url, headers=headers)
+        if response.status_code == 200:
+            return response.text
+        else:
+            print(f"Failed to download file {file_url}: {response.status_code}")
+            return None
 
-    def scrape_terraform_files(self, max_repos=100):
-        repos = self.search_terraform_repos(max_repos)
+    def scrape_terraform_files(self, max_files=1000):
+        files = self.search_terraform_files(max_files)
         terraform_files = []
 
-        with tempfile.TemporaryDirectory() as temp_dir:
-            for repo in tqdm(repos, desc="Scraping repositories"):
-                try:
-                    repo_dir = self.clone_repo(repo, temp_dir)
-                    for root, _, files in os.walk(repo_dir):
-                        for file in files:
-                            if file.endswith('.tf'):
-                                file_path = os.path.join(root, file)
-                                with open(file_path, 'r') as f:
-                                    content = f.read()
-                                terraform_files.append({
-                                    "repo": repo.full_name,
-                                    "file_path": os.path.relpath(file_path, repo_dir),
-                                    "content": content
-                                })
-                except Exception as e:
-                    print(f"Error processing repo {repo.full_name}: {str(e)}")
+        for file in tqdm(files, desc="Scraping Terraform files"):
+            try:
+                # Handle rate limits
+                rate_limit = self.g.get_rate_limit()
+                if rate_limit.search.remaining < self.rate_limit_threshold:
+                    reset_timestamp = rate_limit.search.reset.timestamp()
+                    sleep_time = reset_timestamp - time.time() + 5  # Adding a buffer
+                    print(f"Rate limit reached. Sleeping for {sleep_time} seconds.")
+                    time.sleep(sleep_time)
+
+                file_content = self.download_file_content(file.download_url)
+                if file_content:
+                    terraform_files.append({
+                        "repo": file.repository.full_name,
+                        "file_path": file.path,
+                        "content": file_content
+                    })
+            except Exception as e:
+                print(f"Error processing file {file.path} in repo {file.repository.full_name}: {str(e)}")
 
         return terraform_files
 
     def save_terraform_files(self, terraform_files):
         os.makedirs(self.output_dir, exist_ok=True)
-        for i, tf_file in enumerate(terraform_files):
-            file_name = f"terraform_file_{i}.tf"
-            file_path = os.path.join(self.output_dir, file_name)
+        for tf_file in terraform_files:
+            # Create directory structure matching the repository and file path
+            repo_dir = os.path.join(self.output_dir, tf_file["repo"].replace("/", "_"))
+            os.makedirs(repo_dir, exist_ok=True)
+            file_name = tf_file["file_path"].replace("/", "_")
+            file_path = os.path.join(repo_dir, file_name)
             with open(file_path, 'w') as f:
                 f.write(tf_file["content"])
 
-# Integrate with existing TerraformDataPipeline
-class IntegratedTerraformPipeline(TerraformDataPipeline):
-    def __init__(self, model_name, output_dir, github_token):
-        super().__init__(model_name, output_dir)
+class IntegratedTerraformPipeline:
+    def __init__(self, api_key, output_dir, github_token):
+        self.pipeline = TerraformDataPipeline(api_key, output_dir)
         self.scraper = TerraformGitHubScraper(github_token, os.path.join(output_dir, "scraped_terraform"))
 
-    def scrape_and_process(self, max_repos=100):
-        print("Scraping Terraform repositories from GitHub...")
-        terraform_files = self.scraper.scrape_terraform_files(max_repos)
+    def scrape_and_process(self, max_files=1000):
+        print("Scraping Terraform files from GitHub...")
+        terraform_files = self.scraper.scrape_terraform_files(max_files)
         self.scraper.save_terraform_files(terraform_files)
 
         print("Processing scraped Terraform files...")
         dataset = []
         for tf_file in tqdm(terraform_files, desc="Processing files"):
             code = tf_file["content"]
-            summary = self.generate_summary(code)
+            summary = self.pipeline.generate_summary(code)
             dataset.append({
                 "instruction": summary,
                 "code": code,
@@ -80,26 +90,30 @@ class IntegratedTerraformPipeline(TerraformDataPipeline):
 
 def main():
     github_token = os.environ.get("GITHUB_TOKEN")
+    anthropic_api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not github_token:
         raise ValueError("Please set the GITHUB_TOKEN environment variable")
+    if not anthropic_api_key:
+        raise ValueError("Please set the ANTHROPIC_API_KEY environment variable")
 
     pipeline = IntegratedTerraformPipeline(
-        model_name="meta-llama/Llama-2-7b-hf",
+        api_key=anthropic_api_key,
         output_dir="./terraform_dataset",
         github_token=github_token
     )
 
     print("Scraping and processing Terraform files...")
-    dataset = pipeline.scrape_and_process(max_repos=100)
+    dataset = pipeline.scrape_and_process(max_files=1000)
 
     print("Filtering dataset...")
     data_filter = DatasetFilter()
     filtered_dataset = data_filter.filter_dataset(dataset)
 
     print("Saving dataset...")
-    pipeline.save_dataset(filtered_dataset)
+    pipeline.pipeline.save_dataset(filtered_dataset)
 
     print(f"Generated {len(filtered_dataset)} instruction-code pairs")
 
 if __name__ == "__main__":
     main()
+
